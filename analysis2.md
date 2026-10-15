@@ -1,0 +1,351 @@
+# Current implementation state
+
+## Overview
+
+The repository now contains an in-memory pipeline that converts an
+`Instruction` into resolved knowledge-graph entities and relations:
+
+```text
+Instruction
+    ├── ActorResolver ──> ObservedActor ──> Worker
+    ├── FeedbackResolver ──> feedback action IDs ──> StepFeedback
+    ├── QualificationResolver (optional) ────────> QualificationRecord
+    ├── ObjectResolver ─> ObservedObject ─> Tool | Material | PPE
+    └── Sequencer (excluding feedback) ─> Procedure + Step + StepOrder
+                                                 │
+                              ┌──────────────────┴──────────────────┐
+                              ▼                                     ▼
+                         Inspector                              Refiner
+                              │                                     │
+                     StepExecution + QualityCheck       requirements + parameters
+                              │
+                              ▼
+                  ProcedureExecutionAssembler
+```
+
+The deterministic parts preserve observation order and action references.
+Semantic deduplication, entity enrichment, object classification, and process
+parameter extraction use the existing `Extractor` and its structured LLM
+responses.
+
+Feedback classification, inspection extraction, and qualification extraction
+also use structured LLM responses, but their deterministic assembly stages
+validate IDs and bind results only to resolved graph objects.
+
+## Observation schemas and instruction indexing
+
+File: `backend/schemas/process_knowledge/text.py`
+
+### `ObservedAction`
+
+An action contains:
+
+- `id`
+- start and end timestamps
+- an `actor_id` reference
+- action name
+- optional `object_id`, `instrument_id`, and `target_id` references
+
+### `ObservedActor` and `ObservedObject`
+
+Both observation types have their own typed `id` and contain an ordered
+`action_ids` list recording every
+action in which the observation occurs.
+
+- Actors match by name.
+- Objects match by name and object type.
+- Their `merge()` methods extend `action_ids` while preserving order and
+  removing repeated IDs.
+
+### `Instruction`
+
+An instruction contains `id`, `name`, and ordered segments. During
+initialization it validates globally unique segment, action, actor, and object
+IDs and rejects actor/object endpoints that do not resolve within the action's
+segment. It then builds a read-only `reference_index` containing:
+
+- entities by their typed IDs;
+- ordered reverse actor-to-action and object-to-action references.
+
+The compatibility `actors` and `objects` views are read-only per-segment
+mappings. The helper `extract_actors()` returns actors deduplicated across the
+complete instruction with their action references merged.
+
+`VideoSegment` still numbers repeated actor and object names in observation
+order.
+
+## Resolver layer
+
+File: `backend/extraction/resolver.py`
+
+### Abstract `Resolver`
+
+`Resolver[EntityT, SourceT]` contains the shared logic for:
+
+- collecting entities from a source;
+- deterministic logical deduplication;
+- merging entities through their `matches()` and `merge()` methods;
+- structured LLM-based semantic deduplication;
+- validating that the LLM neither drops nor invents labels;
+- retaining the first-observed order;
+- adding instruction ID and name metadata to LLM prompts.
+
+Resolver entity collections are exposed as tuples. Derived actor/worker and
+object/entity bindings are invalidated whenever entities or sources change,
+and bindings are also exposed as tuples so consumers cannot mutate the cached
+collection.
+
+Semantic deduplication also merges the action references of entities placed in
+the same semantic group.
+
+### `ActorResolver`
+
+`ActorResolver` collects `ObservedActor` instances from an instruction.
+
+Important outputs and methods:
+
+- `actors`: logically deduplicated actors;
+- `semantic_deduplicate()`: LLM-assisted actor identity resolution;
+- `create_workers()`: creates one `Worker` per resolved actor;
+- `worker_bindings`: pairs each created worker with its reference-bearing
+  `ObservedActor`.
+
+Worker extraction preserves exact actor names and order. Optional fields such
+as `role` are requested only when supported by the actor name. The response is
+rejected if a worker is missing, duplicated, invented, or renamed.
+The retained bindings preserve `ObservedActor.action_ids`, allowing a later
+execution stage to resolve each observed action to its worker.
+
+### `ObjectResolver`
+
+`ObjectResolver` collects and deduplicates `ObservedObject` instances.
+
+Important outputs and methods:
+
+- `objects`: logically deduplicated objects;
+- `semantic_deduplicate()`: LLM-assisted object identity resolution;
+- `create_entities()`: classifies each object as `Tool`, `Material`, or `PPE`;
+- `entity_bindings`: pairs each created entity with its reference-bearing
+  `ObservedObject`.
+
+Object classification uses both the name and object type. It requires exactly
+one selected entity field and preserves the original object name. The retained
+bindings allow later stages to connect entities to actions and steps.
+
+## Sequencing
+
+File: `backend/extraction/sequnecer.py`
+
+`Sequencer` performs deterministic conversion from an instruction to the
+procedure sequence:
+
+- creates a `Procedure` from `Instruction.name` and `Instruction.id`;
+- flattens actions in segment and action observation order;
+- creates one globally numbered `Step` per action;
+- retains the serialized action in `Step.source_text`;
+- creates `steps_by_action_id`;
+- creates one `ProcedureHasStep` relation for every generated step;
+- creates a `StepOrder` between every adjacent pair of steps.
+
+It accepts optional `excluded_action_ids`. This is used by `FeedbackResolver`
+so actions that are clearly reported feedback do not incorrectly become
+procedural steps, executions, requirements, or process-parameter targets.
+Excluded IDs must exist in the instruction.
+
+An instruction without actions produces empty step and ordering collections.
+
+Note: the filename is currently spelled `sequnecer.py`, matching the requested
+path, rather than the conventional `sequencer.py`.
+
+## Refinement
+
+File: `backend/extraction/refiner.py`
+
+`Refiner` accepts a `Sequencer` and an `ObjectResolver` whose
+`create_entities()` method has already been called.
+
+Using `ObservedObject.action_ids` and `Sequencer.steps_by_action_id`, it creates:
+
+- `ToolRequirement` for every tool/action link;
+- `MaterialRequirement` for every material/action link;
+- `PPERequirement` for every PPE/action link.
+
+The combined relations are exposed through `relations`, with typed collections
+available as `tool_requirements`, `material_requirements`, and
+`ppe_requirements`.
+
+The refiner then makes one structured LLM call per segment. The LLM receives
+the serialized segment, valid action IDs, and instruction metadata. It may
+return explicit `ProcessParameter` instances associated with action IDs.
+The intermediate response models are named `SegmentRefinement` and
+`ActionRefinement` to distinguish extraction transport structures from final
+knowledge-graph entities.
+
+Parameters are exposed through:
+
+- `process_parameters`;
+- `process_parameters_by_action_id`.
+
+Parameters associated with an action using a tool are also assigned to the
+matching `ToolRequirement.parameters` field. The refiner ignores object links
+to feedback actions excluded from sequencing and supplies only retained action
+IDs to its parameter-extraction prompt.
+
+The refiner rejects:
+
+- use before object entities have been created;
+- object references to unknown actions;
+- duplicate action IDs in one LLM refinement response;
+- action IDs outside the segment being analyzed.
+
+## Inspection and quality checks
+
+File: `backend/extraction/inspector.py`
+
+`Inspector` creates one `StepExecution` per retained observed action. It binds
+the execution to the resolved worker and retains the serialized action plus
+its observed duration. Relative millisecond timestamps are not converted to
+absolute datetimes.
+
+For every segment, the inspector asks the LLM for an `ActionInspection` only
+when a quality requirement or acceptance criterion is explicitly supported.
+Each result must refer to a unique action in that segment. The inspector then:
+
+- preserves the existing `Step` and marks it as `step_type="inspection"`;
+- registers the extracted `QualityRequirement` entity;
+- creates a `QualityCheck` bound to the execution, reporting worker, and
+  requirement.
+
+Actions without supported requirements still have normal `StepExecution`
+records and are not treated as quality checks.
+
+## Worker qualifications
+
+File: `backend/extraction/qualifier.py`
+
+`QualificationResolver` is an optional pipeline stage, enabled with
+`extract_qualifications=True`. It operates on existing resolved workers rather
+than creating or matching workers itself. For each worker it selects relevant
+segments in instruction order—optionally limited by
+`qualification_segments_per_worker`—and makes one worker-scoped structured
+LLM request.
+
+It returns only explicit `QualificationRecord` relations. The prompt prohibits
+inferring certifications or expertise from role labels or generic participation.
+`qualification_segments_per_worker` must be positive when set; `None` uses all
+relevant segments.
+
+## Step feedback
+
+File: `backend/extraction/feedback.py`
+
+`FeedbackResolver` runs before sequencing. For each segment, the LLM identifies
+only explicit question, issue, suggestion, or observation actions and maps each
+one to the retained procedural action it concerns. The resolver validates that
+the feedback source belongs to its segment, occurs only once, and targets an
+existing non-feedback action.
+
+Feedback action IDs are excluded from `Sequencer`. After `Inspector` has built
+the retained executions, the resolver creates `StepFeedback` relations linking
+each feedback item to its target `StepExecution` and reporting `Worker`.
+This avoids mistaking feedback reports for procedural steps.
+
+## Procedure-execution assembly
+
+File: `backend/extraction/executor.py`
+
+`ProcedureExecutionAssembler` deterministically creates one top-level
+`ProcedureExecution` for the instruction. It aggregates the procedure, unique
+step executors in first-execution order, step executions, quality checks, and
+step feedback. It leaves supervisor, absolute timestamps, overall status, and
+overall result unset because the current observation schema does not support
+them reliably.
+
+## Procedural knowledge graph aggregate
+
+File: `backend/schemas/process_knowledge/pkg.py`
+
+`ProceduralKnowledgeGraph` is the canonical in-memory aggregate for entities,
+relations, and the indexes needed to edit one extracted procedure safely. It
+can be populated incrementally by pipeline stages through controlled methods
+for adding a procedure, steps, general entities and relations, and action-bound
+process parameters. Its public entity, relation, step, and ordering collections
+are exposed as tuples.
+
+`ProceduralKnowledgeGraph.from_results(...)` is the assembly boundary for
+completed extraction outputs. It owns the required insertion order—independent
+entities, sequence entities, parameters, then relations—and validates the
+finished graph before returning it. The top-level extraction pipeline delegates
+assembly to this method rather than manipulating graph internals itself.
+
+Source action IDs are used as stable step identifiers because step numbers are
+positional and therefore change when a step is removed. Relation insertion
+checks that every referenced `KGEntity` is already registered in the graph.
+
+`remove_step(action_id, dependent_policy=...)` supports two policies:
+
+- `cascade` removes relations and process parameters that depend on the step;
+- `restrict` refuses removal while such dependents exist.
+
+After removal, the aggregate renumbers all remaining steps contiguously and
+rebuilds `StepOrder` from the ordered action-to-step index. This bridges the
+removed step's predecessor and successor without leaving stale order edges.
+The graph's `validate()` method checks entity membership, step numbering,
+adjacent ordering, and relation endpoints.
+
+The aggregate remains independent of extraction classes so it can also be used
+for manual editing and by later post-processing stages.
+
+## Typical pipeline usage
+
+```python
+pipeline = KnowledgeGraphExtractionPipeline()
+graph = pipeline.extract(instruction)
+```
+
+File: `backend/extraction/pipeline.py`
+
+`KnowledgeGraphExtractionPipeline` is the public façade for the complete
+procedure-specification workflow. It coordinates actor and object resolution,
+sequencing, refinement, graph assembly, and final graph validation. Individual
+stages remain available for focused testing and advanced use, but callers no
+longer need to invoke them in the correct order or transfer their results into
+the graph manually.
+
+The returned graph is automatically populated with every schema class currently
+produced by the stages: `Worker`, `Tool`, `Material`, `PPE`, `Procedure`,
+`Step`, `ProcessParameter`, and `QualityRequirement` entities; and
+`StepOrder`, `ProcedureHasStep`, `ToolRequirement`, `MaterialRequirement`,
+`PPERequirement`, `StepExecution`, `QualityCheck`, `QualificationRecord`,
+`StepFeedback`, and `ProcedureExecution` relations.
+
+The LLM calls require the configured Ollama service unless an `Extractor`
+replacement is injected for testing.
+
+## Verification
+
+The full suite currently passes 49 tests. It includes focused coverage for
+resolver, sequencer, refiner, graph assembly, inspector, qualification,
+feedback, procedure-execution aggregation, and end-to-end graph assembly.
+Ruff passes for the implementation and tests.
+
+The tests use injected fake extractors, so they verify prompts, structured
+response handling, validation, reference merging, ordering, classification,
+and relation construction without requiring a running LLM.
+
+## Current limitations and follow-up work
+
+- The graph aggregate is in-memory and has no persistence adapter yet.
+- The LLM-dependent production path is not covered by an Ollama integration
+  test.
+- Semantic matching relies on labels and instruction metadata rather than the
+  complete segment context.
+- Process parameters can currently be attached directly only to
+  `ToolRequirement`, because the material and PPE requirement schemas have no
+  parameter field.
+- Feedback classification and quality-requirement extraction are conservative
+  LLM judgments; their real-model precision and recall need evaluation against
+  labelled observations.
+- Relative action timestamps cannot supply absolute execution times, and the
+  current observation schema does not establish procedure status, supervisors,
+  or overall acceptance results.
